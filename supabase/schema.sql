@@ -11,9 +11,13 @@ create table if not exists public.guest_profiles (
   match_with text check (match_with in ('Male', 'Female')),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  turnstile_verified_at timestamptz,
   constraint guest_profile_preferences_complete
     check ((gender is null and match_with is null) or (gender is not null and match_with is not null))
 );
+
+alter table public.guest_profiles
+  add column if not exists turnstile_verified_at timestamptz;
 
 create table if not exists public.matches (
   id uuid primary key default gen_random_uuid(),
@@ -77,10 +81,25 @@ create table if not exists public.guest_reports (
   unique (reporter_id, match_id)
 );
 
+create table if not exists public.chat_messages (
+  id uuid primary key default gen_random_uuid(),
+  match_id uuid not null references public.matches(id) on delete cascade,
+  sender_id uuid not null references auth.users(id) on delete cascade,
+  body text not null check (char_length(body) between 1 and 500),
+  created_at timestamptz not null default now()
+);
+
+create index if not exists chat_messages_match_created_idx
+  on public.chat_messages (match_id, created_at);
+
 alter table public.guest_profiles enable row level security;
 alter table public.matches enable row level security;
 alter table public.matchmaking_queue enable row level security;
 alter table public.guest_reports enable row level security;
+alter table public.chat_messages enable row level security;
+
+revoke all on public.chat_messages from anon, authenticated;
+grant select, insert on public.chat_messages to authenticated;
 
 drop policy if exists "Guests can read their own profile" on public.guest_profiles;
 create policy "Guests can read their own profile"
@@ -103,6 +122,34 @@ create policy "Guests can read matches they participate in"
 -- No browser write policies are defined. The trusted API verifies each Supabase
 -- access token before using the service-role client to mutate queue and reports.
 -- guest_reports intentionally has no client read policy.
+
+drop policy if exists "Matched guests can read conversation messages" on public.chat_messages;
+create policy "Matched guests can read conversation messages"
+  on public.chat_messages for select
+  to authenticated
+  using (
+    exists (
+      select 1 from public.matches m
+      where m.id = chat_messages.match_id
+        and m.state = 'active'
+        and (auth.uid() = m.user_a_id or auth.uid() = m.user_b_id)
+    )
+  );
+
+drop policy if exists "Matched guests can send conversation messages" on public.chat_messages;
+create policy "Matched guests can send conversation messages"
+  on public.chat_messages for insert
+  to authenticated
+  with check (
+    sender_id = auth.uid()
+    and char_length(body) between 1 and 500
+    and exists (
+      select 1 from public.matches m
+      where m.id = chat_messages.match_id
+        and m.state = 'active'
+        and (auth.uid() = m.user_a_id or auth.uid() = m.user_b_id)
+    )
+  );
 
 drop function if exists public.match_guest_queue(uuid);
 create or replace function public.match_guest_queue(p_user_id uuid, p_chat_mode text)
@@ -323,4 +370,22 @@ exception
   when duplicate_object then null;
   when undefined_object then
     raise notice 'supabase_realtime publication is unavailable; enable Realtime for matchmaking_queue in the Supabase dashboard.';
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.chat_messages;
+exception
+  when duplicate_object then null;
+  when undefined_object then
+    raise notice 'supabase_realtime publication is unavailable; enable Realtime for chat_messages in the Supabase dashboard.';
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.matches;
+exception
+  when duplicate_object then null;
+  when undefined_object then
+    raise notice 'supabase_realtime publication is unavailable; enable Realtime for matches in the Supabase dashboard.';
 end $$;

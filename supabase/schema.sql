@@ -19,6 +19,7 @@ create table if not exists public.matches (
   id uuid primary key default gen_random_uuid(),
   user_a_id uuid not null references auth.users(id) on delete cascade,
   user_b_id uuid not null references auth.users(id) on delete cascade,
+  chat_mode text not null default 'video' check (chat_mode in ('video', 'text')),
   state text not null default 'active' check (state in ('active', 'ended')),
   ended_by uuid references auth.users(id),
   daily_room_name text not null unique,
@@ -39,6 +40,7 @@ create table if not exists public.matchmaking_queue (
   user_id uuid primary key references auth.users(id) on delete cascade,
   gender text not null check (gender in ('Male', 'Female')),
   match_with text not null check (match_with in ('Male', 'Female')),
+  chat_mode text not null default 'video' check (chat_mode in ('video', 'text')),
   state text not null default 'waiting' check (state in ('waiting', 'matched')),
   match_id uuid references public.matches(id) on delete set null,
   created_at timestamptz not null default now(),
@@ -47,6 +49,20 @@ create table if not exists public.matchmaking_queue (
 
 create index if not exists matchmaking_queue_waiting_preferences_idx
   on public.matchmaking_queue (gender, match_with, created_at)
+  where state = 'waiting';
+
+alter table public.matches add column if not exists chat_mode text not null default 'video';
+alter table public.matches drop constraint if exists matches_chat_mode_check;
+alter table public.matches add constraint matches_chat_mode_check
+  check (chat_mode in ('video', 'text'));
+alter table public.matchmaking_queue add column if not exists chat_mode text not null default 'video';
+alter table public.matchmaking_queue drop constraint if exists matchmaking_queue_chat_mode_check;
+alter table public.matchmaking_queue add constraint matchmaking_queue_chat_mode_check
+  check (chat_mode in ('video', 'text'));
+
+drop index if exists public.matchmaking_queue_waiting_preferences_idx;
+create index matchmaking_queue_waiting_preferences_idx
+  on public.matchmaking_queue (chat_mode, gender, match_with, created_at)
   where state = 'waiting';
 
 create table if not exists public.guest_reports (
@@ -88,7 +104,8 @@ create policy "Guests can read matches they participate in"
 -- access token before using the service-role client to mutate queue and reports.
 -- guest_reports intentionally has no client read policy.
 
-create or replace function public.match_guest_queue(p_user_id uuid)
+drop function if exists public.match_guest_queue(uuid);
+create or replace function public.match_guest_queue(p_user_id uuid, p_chat_mode text)
 returns table(match_id uuid, partner_id uuid, daily_room_name text)
 language plpgsql
 security definer
@@ -97,12 +114,16 @@ as $$
 declare
   v_gender text;
   v_match_with text;
+  v_chat_mode text;
   v_partner_id uuid;
   v_match_id uuid;
   v_room_name text;
 begin
   if p_user_id is null then
     raise exception 'A guest id is required';
+  end if;
+  if p_chat_mode is null or p_chat_mode not in ('video', 'text') then
+    raise exception 'A valid chat mode is required';
   end if;
 
   -- Serialize the short pairing transaction so concurrent queue joins cannot
@@ -122,6 +143,7 @@ begin
     into v_match_id, v_partner_id, v_room_name
   from public.matches m
   where m.state = 'active'
+    and m.chat_mode = p_chat_mode
     and (m.user_a_id = p_user_id or m.user_b_id = p_user_id)
   order by m.created_at desc
   limit 1;
@@ -131,15 +153,17 @@ begin
     return;
   end if;
 
-  select p.gender, p.match_with
-    into v_gender, v_match_with
+  select p.gender, p.match_with, q.chat_mode
+    into v_gender, v_match_with, v_chat_mode
   from public.guest_profiles p
+  join public.matchmaking_queue q on q.user_id = p.user_id
   where p.user_id = p_user_id;
 
   if v_gender is null
      or v_match_with is null
      or v_gender not in ('Male', 'Female')
-     or v_match_with not in ('Male', 'Female') then
+     or v_match_with not in ('Male', 'Female')
+     or v_chat_mode <> p_chat_mode then
     raise exception 'Valid gender preferences are required';
   end if;
 
@@ -148,6 +172,7 @@ begin
   from public.matchmaking_queue q
   where q.user_id <> p_user_id
     and q.state = 'waiting'
+    and q.chat_mode = p_chat_mode
     and q.gender = v_match_with
     and q.match_with = v_gender
   order by random()
@@ -161,8 +186,8 @@ begin
   v_match_id := gen_random_uuid();
   v_room_name := 'jayvc-' || replace(v_match_id::text, '-', '');
 
-  insert into public.matches (id, user_a_id, user_b_id, daily_room_name)
-  values (v_match_id, p_user_id, v_partner_id, v_room_name);
+  insert into public.matches (id, user_a_id, user_b_id, chat_mode, daily_room_name)
+  values (v_match_id, p_user_id, v_partner_id, p_chat_mode, v_room_name);
 
   update public.matchmaking_queue
   set state = 'matched', match_id = v_match_id, updated_at = now()
@@ -280,12 +305,12 @@ begin
 end;
 $$;
 
-revoke all on function public.match_guest_queue(uuid) from public, anon, authenticated;
+revoke all on function public.match_guest_queue(uuid, text) from public, anon, authenticated;
 revoke all on function public.claim_daily_room(uuid, uuid) from public, anon, authenticated;
 revoke all on function public.save_daily_room(uuid, uuid, text) from public, anon, authenticated;
 revoke all on function public.fail_daily_room(uuid, uuid) from public, anon, authenticated;
 revoke all on function public.end_guest_match(uuid) from public, anon, authenticated;
-grant execute on function public.match_guest_queue(uuid) to service_role;
+grant execute on function public.match_guest_queue(uuid, text) to service_role;
 grant execute on function public.claim_daily_room(uuid, uuid) to service_role;
 grant execute on function public.save_daily_room(uuid, uuid, text) to service_role;
 grant execute on function public.fail_daily_room(uuid, uuid) to service_role;

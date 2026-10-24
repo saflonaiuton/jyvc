@@ -1,0 +1,13 @@
+{
+  "name": "jayvc",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node --check index.js && node --check server/index.mjs",
+    "start": "node index.js"
+  }
+}
